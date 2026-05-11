@@ -140,7 +140,8 @@ def compute_smile_scores(items: list, lang: str, verbose: bool = False) -> list:
 
     for item in items:
         pred = item["pred"]
-        best_score = {"smile_avg": 0.0, "smile_hm": 0.0}
+        best_avg = 0.0
+        best_hm  = 0.0
 
         for ref_ans in item["answers"]:
             # Set to use_ans=True mode
@@ -148,14 +149,15 @@ def compute_smile_scores(items: list, lang: str, verbose: bool = False) -> list:
             try:
                 results = smile_obj.generate_scores(qa_set)
                 avg_val = float(results["avg"][0])
-                hm_val = float(results["hm"][0])
-                if avg_val > best_score["smile_avg"]:
-                    best_score["smile_avg"] = avg_val
-                    best_score["smile_hm"] = hm_val
+                hm_val  = float(results["hm"][0])
+                if avg_val > best_avg:
+                    best_avg = avg_val
+                if hm_val > best_hm:
+                    best_hm = hm_val
             except Exception as e:
                 if verbose:
                     print(f"  SMILE error for qid={item['question_id']}: {e}")
-        
+        best_score = {"smile_avg": best_avg, "smile_hm": best_hm}
         all_scores.append(best_score)
     
     return all_scores

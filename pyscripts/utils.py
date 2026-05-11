@@ -7,6 +7,8 @@ from tqdm import tqdm
 from rouge_score import rouge_scorer
 import os
 import unicodedata
+import importlib
+import sys as _sys
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -19,10 +21,17 @@ nltk.download('punkt_tab', quiet=True)
 nltk.download('wordnet', quiet=True)
 
 from multilingual_utils import (
-    normalize_lang, rouge_preprocess, multilingual_tokenize,
+    normalize_lang, multilingual_tokenize,
     get_bertscore_lang, get_bertscore_model, get_sbert_model,
-    get_moverscore_model, unicode_normalize, is_char_tokenize_lang,
+    get_moverscore_model, unicode_normalize
 )
+
+
+def _make_rouge_tokenizer(lang):
+    """Returns a tokenizer function for the given language."""
+    def tokenize(text):
+        return multilingual_tokenize(text, lang)
+    return tokenize
 
 def compute_rouge_score(metrics:list=['rougeL'], pred_col='pred', sub_metrics=['fmeasure'], ref_data=None, ans_idx:int=1, lang:str='en'):
     """
@@ -47,22 +56,19 @@ def compute_rouge_score(metrics:list=['rougeL'], pred_col='pred', sub_metrics=['
         ans.append(str(data[ans_idx]))
         preds.append(data[-1])
 
-    # Pre-process for multilingual - character-level tokenization for non-space languages
-    if is_char_tokenize_lang(lang):
-        ans = [rouge_preprocess(a, lang) for a in ans]
-        preds = [rouge_preprocess(p, lang) for p in preds]
-
     # Initialize ROUGE scorer
     # Disable stemmer for non-English
+    tokenizer = _make_rouge_tokenizer(lang) if lang != 'en' else None
     use_stemmer = (lang == 'en')
-    scorer = rouge_scorer.RougeScorer(metrics, use_stemmer=use_stemmer)
+    scorer = rouge_scorer.RougeScorer(metrics, use_stemmer=use_stemmer, tokenizer=tokenizer)
+
     rouge_rslts = {metric: {sub_metric:[] for sub_metric in sub_metrics} for metric in metrics}
 
     for ref, cand in tqdm(zip(ans, preds), total=len(ans)):
         scores = scorer.score(ref, cand)
         for key, data in rouge_rslts.items():
             for metric in sub_metrics:
-                if metric=='fmeasure':
+                if metric == 'fmeasure':
                     data[metric].append(scores[key].fmeasure)
 
     
@@ -107,6 +113,12 @@ def compute_bert_score(inp_data, pred_col='pred', ans_idx:int=1, lang:str='en'):
 
     return bert_result
 
+
+class _IdentityStemmer:
+    """Not performing any stemmer for non-English METEOR: returns tokens unchanged."""
+    def stem(self, token: str) -> str:
+        return token
+
 def compute_meteor_score(inp_data, pred_col='pred', ans_idx:int=1, lang:str='en'):
     """
     Calculates the METEOR score between a reference and prediction text.
@@ -141,6 +153,8 @@ def compute_meteor_score(inp_data, pred_col='pred', ans_idx:int=1, lang:str='en'
             try:
                 score = meteor_score(
                     [tokenized_reference], tokenized_hypothesis,
+                    stemmer=_IdentityStemmer(),
+                    wordnet=None,
                     alpha=0.9, beta=3.0, gamma=0.5
                 )
             except Exception:
@@ -283,6 +297,17 @@ def compute_moverscore(inp_data, ans_idx=1, model='bert-base-uncased', n_gram=2,
         Paper findings: n_gram=2 with BERT-MNLI achieved highest correlation with human judgments.
     """
     lang = normalize_lang(lang)
+
+    # Auto-select model for non-English
+    if lang != 'en':
+        model = get_moverscore_model(lang)
+
+    current_model = os.environ.get('MOVERSCORE_MODEL', '')
+    os.environ['MOVERSCORE_MODEL'] = model
+
+    if 'moverscore_v2' in _sys.modules and current_model != model:
+        # Model changed since last import, reload so the new env var is set
+        importlib.reload(_sys.modules['moverscore_v2'])
     
     try:
         from moverscore_v2 import get_idf_dict, word_mover_score
@@ -291,13 +316,6 @@ def compute_moverscore(inp_data, ans_idx=1, model='bert-base-uncased', n_gram=2,
             "MoverScore not found. Please install it using:\n"
             "pip install -U git+https://github.com/AIPHES/emnlp19-moverscore.git"
         )
-    
-    # Auto-select model for non-English
-    if lang != 'en':
-        model = get_moverscore_model(lang)
-    
-    # Set the model via environment variable (MoverScore's way of selecting models)
-    os.environ['MOVERSCORE_MODEL'] = model
     
     ans = [str(data[ans_idx]) for data in inp_data]
     preds = [str(data[-1]) for data in inp_data]

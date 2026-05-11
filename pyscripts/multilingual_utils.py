@@ -147,19 +147,6 @@ def multilingual_tokenize(text: str, lang: str) -> list:
         return text.split()
 
 
-def rouge_preprocess(text: str, lang: str) -> str:
-    """
-    Pre-process text for ROUGE scoring.
-    For character-level languages, insert spaces between every character.
-    For space-delimited languages, return it in same way as given.
-    """
-    lang = normalize_lang(lang)
-    text = unicode_normalize(text)
-    if lang in _CHAR_TOKENIZE_LANGS:
-        return " ".join(ch for ch in text if not ch.isspace())
-    return text
-
-
 def unicode_normalize(text: str) -> str:
     """Apply NFC unicode normalization."""
     return unicodedata.normalize("NFC", text)

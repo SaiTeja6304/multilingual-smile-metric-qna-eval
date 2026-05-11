@@ -26,6 +26,7 @@ dependencies = [
     "bert-score",
     "rouge-score",
     "moverscore @ git+https://github.com/AIPHES/emnlp19-moverscore.git",
+    "bleurt @ git+https://github.com/google-research/bleurt.git",
     "pyemd",
     "evaluate"
 ]
