@@ -1,0 +1,11 @@
+{"question_id": "en_1", "question": "What is the capital of France?", "answers": ["Paris", "The capital of France is Paris"], "lang": "en"}
+{"question_id": "en_2", "question": "Who wrote Romeo and Juliet?", "answers": ["William Shakespeare"], "lang": "en"}
+{"question_id": "ar_1", "question": "ما هي عاصمة مصر؟", "answers": ["القاهرة"], "lang": "ar"}
+{"question_id": "ar_2", "question": "ما هو أكبر كوكب في المجموعة الشمسية؟", "answers": ["المشتري"], "lang": "ar"}
+{"question_id": "ja_1", "question": "日本の首都はどこですか？", "answers": ["東京"], "lang": "ja"}
+{"question_id": "ja_2", "question": "富士山の高さは？", "answers": ["3776メートル", "3776m"], "lang": "ja"}
+{"question_id": "ko_1", "question": "대한민국의 수도는 어디인가요?", "answers": ["서울"], "lang": "ko"}
+{"question_id": "ru_1", "question": "Какая столица России?", "answers": ["Москва"], "lang": "ru"}
+{"question_id": "fi_1", "question": "Mikä on Suomen pääkaupunki?", "answers": ["Helsinki"], "lang": "fi"}
+{"question_id": "bn_1", "question": "বাংলাদেশের রাজধানী কী?", "answers": ["ঢাকা"], "lang": "bn"}
+{"question_id": "te_1", "question": "భారతదేశ రాజధాని ఏమిటి?", "answers": ["న్యూ ఢిల్లీ"], "lang": "te"}

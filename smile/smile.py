@@ -8,8 +8,7 @@ import random
 import time
 from tqdm import tqdm
 import sys
-from nltk.corpus import stopwords, wordnet
-from nltk.stem import WordNetLemmatizer
+import unicodedata
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Download essential nltk vocabulary & tagger (quiet=True to avoid race conditions in parallel runs)
@@ -20,14 +19,23 @@ try:
 except FileExistsError:
     pass  # Another process already downloaded it
 
+
+sys.path.append(str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'pyscripts')))
+from multilingual_utils import (
+    normalize_lang, get_stopwords, get_stemmer, is_char_tokenize_lang,
+    multilingual_tokenize, unicode_normalize, get_smile_emb_model,
+    SUPPORTED_LANGUAGES,
+)
+
 class SMILE:
-    def __init__(self, emb_model:str, eval_metrics:list, avg_w1=0.5, avg_w2=0.5, hm_w1=0.5, hm_w2=0.5, assign_bins=False, use_exact_matching=False, remove_punctuation=True, save_emb_folder=None, load_emb_folder=None, syn_ans_model=None, verbose=True):
+    def __init__(self, emb_model:str, eval_metrics:list, lang:str='en', avg_w1=0.5, avg_w2=0.5, hm_w1=0.5, hm_w2=0.5, assign_bins=False, use_exact_matching=False, remove_punctuation=True, save_emb_folder=None, load_emb_folder=None, syn_ans_model=None, verbose=True):
         """
         Initialize SMILE metric.
         
         Parameters:
-            emb_model (str): Name of the embedding model to use.
+            emb_model (str): Name of the embedding model to use. Use 'auto' to automatically select based on language.
             eval_metrics (list): List of evaluation metrics to compute ('avg', 'hm', 'wt avg', 'wt hm').
+            lang (str): Language for evaluation. Supports: ar, bn, en, fi, ja, ko, ru, te.
             avg_w1 (float): Weight for sentence score in weighted average.
             avg_w2 (float): Weight for keyword score in weighted average.
             hm_w1 (float): Weight for sentence score in weighted harmonic mean.
@@ -42,6 +50,9 @@ class SMILE:
             syn_ans_model (str): Name of the synthetic answer model.
             verbose (bool): Whether to print progress messages.
         """
+        # Language setup
+        self.lang = normalize_lang(lang)
+
         if torch.cuda.is_available():
             ## Uncomment the code below to randomly assign a gpu to use
             # cuda_visible_device = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
@@ -51,9 +62,26 @@ class SMILE:
         else:
             self.device = 'cpu'
 
+        # Auto-select embedding model if 'auto' is passed
+        if emb_model == 'auto':
+            emb_model = get_smile_emb_model(self.lang)
+            if verbose:
+                print(f'  > Auto-selected embedding model for {self.lang}: {emb_model}')
+
         self.emb_model = self._get_emb_model(emb_model)
-        self.stopwords = set(stopwords.words('english'))
-        self.lemmatizer = WordNetLemmatizer()
+        
+        # Language-aware stopwords and stemmer/lemmatizer
+        self.stopwords = get_stopwords(self.lang)
+        self._stemmer = get_stemmer(self.lang)
+        self._is_char_lang = is_char_tokenize_lang(self.lang)
+        
+        # For English, using the WordNet-based lemmatizer with POS tagging
+        if self.lang == 'en':
+            from nltk.corpus import wordnet
+            self._wordnet = wordnet
+        else:
+            self._wordnet = None
+
         self.eval_metrics = eval_metrics
         
         # Sanity check: weights must sum to 1
@@ -102,6 +130,9 @@ class SMILE:
                     - 'ember-v1'
                     - 'SFR-Embedding-2_R'
                     - 'gte-Qwen2-7B-instruct'
+                    - 'paraphrase-multilingual-mpnet-base-v2' (multilingual)
+                    - 'paraphrase-multilingual-MiniLM-L12-v2' (multilingual)
+                    - 'LaBSE' (multilingual)
 
         Returns:
             SentenceTransformer: The loaded embedding model instance.
@@ -118,9 +149,25 @@ class SMILE:
             # model.max_seq_length = 8192
             return model
         
+        elif emb_model == 'paraphrase-multilingual-mpnet-base-v2':
+            return SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2', device=self.device)
+        
+        elif emb_model == 'paraphrase-multilingual-MiniLM-L12-v2':
+            return SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', device=self.device)
+        
+        elif emb_model == 'LaBSE':
+            return SentenceTransformer('sentence-transformers/LaBSE', device=self.device)
+        
+        else:
+            # Loading a HuggingFace model as fallback
+            if self.verbose:
+                print(f'  > Loading custom embedding model: {emb_model}')
+            return SentenceTransformer(emb_model, device=self.device)
+        
     def _process_kwds(self, kwd:str):
         """
-        Preprocesses a keyword string by lowercasing, optionally removing punctuation, and lemmatizing each word.
+        Preprocesses a keyword string by lowercasing, optionally removing punctuation, 
+        and lemmatizing/stemming each word (language-aware).
 
         Parameters:
             kwd (str): The keyword or phrase to process.
@@ -128,13 +175,14 @@ class SMILE:
         Returns:
             tuple: A tuple containing:
                 - post_kwd (str): The processed keyword string.
-                - len_kwd (int): The number of words in the processed keyword.
+                - len_kwd (int): The number of tokens in the processed keyword.
         
         Note:
             If remove_punctuation=False, decimal points and other punctuation are preserved.
             This is useful for fine-grained numerical evaluation (e.g., 1.2cm vs 1.3cm).
         """
-        post_kwd = kwd.lower().strip()
+        # Unicode normalize
+        post_kwd = unicode_normalize(kwd).lower().strip()
         
         # Always remove trailing sentence-ending punctuation regardless of remove_punctuation flag
         # This handles: periods, exclamation marks, question marks, and their combinations
@@ -144,16 +192,26 @@ class SMILE:
         # Optionally remove punctuation (controlled by self.remove_punctuation)
         if self.remove_punctuation:
             # Remove all punctuation - default behavior for backward compatibility
-            post_kwd = re.sub(r'[^\w\s]', '', post_kwd)
+            # Unicode-aware pattern for multilingual text
+            post_kwd = re.sub(r'[^\w\s]', '', post_kwd, flags=re.UNICODE)
         else:
             # Preserve decimals and certain punctuation for fine-grained evaluation
-            # Only remove punctuation that doesn't affect numerical meaning
             # Keep: . (decimals), - (negatives), / (fractions)
-            post_kwd = re.sub(r'[^\w\s.\-/]', '', post_kwd)
+            post_kwd = re.sub(r'[^\w\s.\-/]', '', post_kwd, flags=re.UNICODE)
         
-        # Uncomment below to filter based on stop words
-        # post_kwd = ' '.join([self.lemmatizer.lemmatize(word, self._get_pos_tag(word)) for word in post_kwd.split() if word not in self.stopwords])
-        post_kwd = ' '.join([self.lemmatizer.lemmatize(word, self._get_pos_tag(word)) for word in post_kwd.split()])
+        # Language based stemming/lemmatization
+        if self.lang == 'en' and self._stemmer is not None:
+            # For English, use WordNet lemmatizer with POS tagging
+            post_kwd = ' '.join([self._stemmer.lemmatize(word, self._get_pos_tag(word)) for word in post_kwd.split()])
+        elif self._stemmer is not None:
+            # Arabic, Finnish, Russian, use Snowball stemmer
+            tokens = self._tokenize_for_kwds(post_kwd)
+            post_kwd = ' '.join([self._stemmer.stem(word) for word in tokens])
+        else:
+            # Bengali, Japanese, Korean, Telugu, no stemming, just tokenize
+            tokens = self._tokenize_for_kwds(post_kwd)
+            post_kwd = ' '.join(tokens)
+        
         #TODO - convert a digit to string data using 'inflect' module
         # If after postprocessing the string is empty use the keyword string as it is.
         if len(post_kwd)==0: post_kwd = kwd.lower()
@@ -161,9 +219,19 @@ class SMILE:
 
         return (post_kwd, len_kwd)
 
+    def _tokenize_for_kwds(self, text: str) -> list:
+        """
+        Tokenize text for keyword processing, language based.
+        For character-level languages, returns individual characters.
+        For space-delimited languages, splits on whitespace.
+        """
+        if self._is_char_lang:
+            return [ch for ch in text if not ch.isspace()]
+        return text.split()
+
     def _get_pos_tag(self, word:str):
         """
-        Maps a word to its respective Part-of-Speech (POS) tag for lemmatization.
+        Maps a word to its respective Part-of-Speech (POS) tag for lemmatization. Only used for English.
 
         Parameters:
             word (str): The word to tag.
@@ -171,9 +239,12 @@ class SMILE:
         Returns:
             str: The WordNet POS tag (ADJ, NOUN, VERB, or ADV). Defaults to NOUN if not found.
         """
+        if self._wordnet is None:
+            # For non-English, return default NOUN tag
+            return 'n'
         tag = nltk.pos_tag([word])[0][1][0].upper()
-        tag_dict = {"J":wordnet.ADJ, "N":wordnet.NOUN, "V":wordnet.VERB, "R":wordnet.ADV}
-        return tag_dict.get(tag, wordnet.NOUN)
+        tag_dict = {"J":self._wordnet.ADJ, "N":self._wordnet.NOUN, "V":self._wordnet.VERB, "R":self._wordnet.ADV}
+        return tag_dict.get(tag, self._wordnet.NOUN)
     
     def _get_kwd_score(self, ans_embs, len_ans, preds, pred_kwd_embs):
         """

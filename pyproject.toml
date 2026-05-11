@@ -3,16 +3,12 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name="smile"
+name="multilingual_smile"
 version="0.1.0"
-description = "SMILE: A Composite Lexical-Semantic Metric for Question-Answering Evaluation"
+description = "Multilingual SMILE: A Multilingual Extension of the Composite Lexical-Semantic SMILE Metric for LLM-Generated Response Evaluation"
 authors = [
-    {name="Shrikant Kendre"},
-    {name="Austin Xu"},
-    {name="Shafiq Joty"},
-    {name="Juan Carlos Niebles"},
-    {name="Honglu Zhou"},
-    {name="Michael Ryoo"}
+    {name="Sai Teja Sunku"},
+    {name="Ronak Wani"}
 ]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,6 +30,12 @@ dependencies = [
     "evaluate"
 ]
 
+[tool.setuptools]
+py-modules = ["main"]
+
 [tool.setuptools.packages.find]
-include = ["smile*"]
-exclude = ["pyscripts*", "sample_data*"]
+include = ["smile*", "pyscripts*"]
+exclude = ["sample_data*"]
+
+[project.scripts]
+multilingual-smile = "main:main"
