@@ -1,6 +1,5 @@
 # Multilingual SMILE: A Composite Lexical-Semantic Metric for Question-Answering Evaluation
 
-[![arXiv](https://img.shields.io/badge/arXiv-2406.XXXX-blue.svg)](https://arxiv.org/abs/2406.XXXX)
 
 This repository provides a **Multilingual** implementation of **SMILE: Semantic Metric Integrating Lexical Exactness**, a novel metric for evaluating natural language generation.
 
@@ -8,7 +7,7 @@ This repository provides a **Multilingual** implementation of **SMILE: Semantic 
 SMILE is a lightweight and reliable evaluation metric for textual and visual question answering tasks. Unlike traditional metrics like ROUGE, METEOR, and Exact Match that focus purely on lexical overlap, or embedding-based metrics like BERTScore that overlook lexical precision, SMILE strikes a balance by combining sentence-level semantics, keyword-level understanding, and exact lexical matching. This hybrid approach offers a more comprehensive and interpretable evaluation, aligning closely with human judgment while avoiding the cost, bias, and inconsistency often associated with LLM-based metrics.
 
 ### Multilingual Support
-This fork extends SMILE to support native, robust evaluation across 8 languages using standard ISO 639-1 language codes:
+This fork extends SMILE to support native, robust evaluation across the following 8 languages:
 - **`ar`** (Arabic)
 - **`bn`** (Bengali)
 - **`en`** (English)
