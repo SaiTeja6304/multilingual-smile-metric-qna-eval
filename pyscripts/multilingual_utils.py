@@ -9,14 +9,8 @@ SUPPORTED_LANGUAGES = [
     "ja", "ko", "ru", "te",
 ]
 
-# ISO codes for BERTScore
-_LANG_TO_ISO = {
-    "ar": "ar", "bn": "bn", "en": "en", "fi": "fi",
-    "ja": "ja", "ko": "ko", "ru": "ru", "te": "te",
-}
-
 # Languages where words are NOT separated by spaces.
-_CHAR_TOKENIZE_LANGS = {"ja", "ko", "bn", "te", "ar"}
+_CHAR_TOKENIZE_LANGS = {"ja", "ko"}
 
 # NLTK supported stopwords corpus names
 _NLTK_STOPWORD_LANGS = {
@@ -69,7 +63,7 @@ _TELUGU_STOPWORDS = {
 
 
 def normalize_lang(lang: str) -> str:
-    """Normalize language name to lowercase canonical form."""
+    """Normalize language name to lowercase form."""
     lang = lang.strip().lower()
     aliases = {
         "finnish": "fi", "finish": "fi", "fin": "fi", 
@@ -84,9 +78,8 @@ def normalize_lang(lang: str) -> str:
 
 
 def get_bertscore_lang(lang: str) -> str:
-    """Return ISO code used by the bert-score library."""
-    lang = normalize_lang(lang)
-    return _LANG_TO_ISO[lang]
+    """Return language code used by the bert-score library."""
+    return normalize_lang(lang)
 
 
 def get_bertscore_model(lang: str) -> str:
@@ -148,7 +141,7 @@ def multilingual_tokenize(text: str, lang: str) -> list:
     lang = normalize_lang(lang)
     text = unicode_normalize(text)
     if lang in _CHAR_TOKENIZE_LANGS:
-        # Character-level: each character is a token (skip whitespace)
+        # Character-level - each character is a token
         return [ch for ch in text if not ch.isspace()]
     else:
         return text.split()
