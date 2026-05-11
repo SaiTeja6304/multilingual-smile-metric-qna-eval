@@ -115,7 +115,7 @@ def compute_bert_score(inp_data, pred_col='pred', ans_idx:int=1, lang:str='en'):
 
 
 class _IdentityStemmer:
-    """Not performing any stemmer for non-English METEOR: returns tokens unchanged."""
+    """Not performing any stemmer for non-English METEOR, returns tokens unchanged."""
     def stem(self, token: str) -> str:
         return token
 
