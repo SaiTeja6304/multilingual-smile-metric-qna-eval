@@ -1,19 +1,34 @@
-# SMILE: A Composite Lexical-Semantic Metric for Question-Answering Evaluation
+# Multilingual SMILE: A Composite Lexical-Semantic Metric for Question-Answering Evaluation
 
 [![arXiv](https://img.shields.io/badge/arXiv-2406.XXXX-blue.svg)](https://arxiv.org/abs/2406.XXXX)
 
-This repository provides an implementation of **SMILE: Semantic Metric Integrating Lexical Exactness**, a novel metric for evaluating natural language generation.
+This repository provides a **Multilingual** implementation of **SMILE: Semantic Metric Integrating Lexical Exactness**, a novel metric for evaluating natural language generation.
+
 ## What is SMILE?
 SMILE is a lightweight and reliable evaluation metric for textual and visual question answering tasks. Unlike traditional metrics like ROUGE, METEOR, and Exact Match that focus purely on lexical overlap, or embedding-based metrics like BERTScore that overlook lexical precision, SMILE strikes a balance by combining sentence-level semantics, keyword-level understanding, and exact lexical matching. This hybrid approach offers a more comprehensive and interpretable evaluation, aligning closely with human judgment while avoiding the cost, bias, and inconsistency often associated with LLM-based metrics.
+
+### Multilingual Support
+This fork extends SMILE to support native, robust evaluation across 8 languages using standard ISO 639-1 language codes:
+- **`ar`** (Arabic)
+- **`bn`** (Bengali)
+- **`en`** (English)
+- **`fi`** (Finnish)
+- **`ja`** (Japanese)
+- **`ko`** (Korean)
+- **`ru`** (Russian)
+- **`te`** (Telugu)
+
+The codebase automatically selects the appropriate models (e.g. `paraphrase-multilingual-mpnet-base-v2`, `bert-base-multilingual-cased`, `BLEURT-20`), applies appropriate language-specific stemming and NLTK stopwords, and uses character-level tokenization for languages without space-delimited words (e.g. Japanese, Korean).
 
 ## Directory Structure
 
 ```
-smile-metric-qna-eval/
+multilingual-smile-metric-qna-eval/
 ├── smile/
 │   ├── __init__.py
 │   └── smile.py                 # Core SMILE implementation
 ├── pyscripts/
+│   ├── multilingual_utils.py    # Language configuration and utilities
 │   ├── generate_scores.py       # Main scoring script for all metrics
 │   ├── generate_syn_ans.py      # Synthetic answer generation
 │   ├── eval_perf.py             # Correlation analysis and evaluation
@@ -37,7 +52,10 @@ smile-metric-qna-eval/
 │   └── human_eval/              # Human evaluation annotations
 │       └── reviewer_*.csv
 ├── sample_data/
+│   ├── test_input.jsonl         # Sample multilingual LLM predictions
+│   ├── test_ground_truth.jsonl  # Sample multilingual ground truth references
 │   └── sample_input.json        # Sample input for quick testing
+├── main.py                      # Main multilingual evaluation entry point
 ├── smile_sample_usage.py        # Quick-start sample script
 ├── requirements.txt
 ├── pyproject.toml
@@ -49,8 +67,8 @@ smile-metric-qna-eval/
 Clone this repository and install the dependencies:
 
 ```bash
-git clone git@github.com:SalesforceAIResearch/smile-metric-qna-eval.git
-cd smile-metric-qna-eval
+git clone git@github.com:SaiTeja6304/multilingual-smile-metric-qna-eval.git
+cd multilingual-smile-metric-qna-eval
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -58,125 +76,64 @@ pip install -r requirements.txt
 
 Alternatively, you can also install using pip:
 ```bash
-pip install git+https://github.com/SalesforceAIResearch/smile-metric-qna-eval.git
+pip install git+https://github.com/SaiTeja6304/multilingual-smile-metric-qna-eval.git
 ```
 
 ## Quick Run
 
-Run the included sample script from the repository root to quickly verify your setup:
+Run the main evaluation script on the included sample data to quickly verify your setup:
 
 ```bash
-python3 smile_sample_usage.py
+python3 main.py --input sample_data/test_input.jsonl --ground-truth sample_data/test_ground_truth.jsonl --output sample_data/test_results.csv --metrics exact_match rouge --verbose
 ```
 
 What this does:
-- Loads the sample data from `sample_data/sample_input.json`
-- Initializes SMILE with default settings (e.g., `ember-v1`, exact matching on)
-- Computes scores and prints a concise summary
-
-Example output (values will vary by environment/models):
-
-```text
-================================================================
-Step 1: Loading sample input 📥
-================================================================
-Loaded rows: 3 📦
-
-================================================================
-Step 2: Initializing SMILE 🙂
-================================================================
-
-================================================================
-Step 3: Computing SMILE scores 🧮⚙️
-================================================================
-
-================================================================
-Step 4: Results summary 📊
-================================================================
-Sentence embedding score (mean): 0.8421 ✨
-Keyword score (mean): 0.7667 🔑
-SMILE avg (mean): 0.8044 😊
-SMILE hm  (mean): 0.7923 🤝
-
--- First item details 🔎 --
-question: What is the capital of France?
-answer  : Paris
-syn_ans : The capital of France is Paris.
-pred    : Paris is known to the capital of France.
-sent_emb_score: 0.8512 ✨
-kwd_score     : 0.7500 🔑
-avg           : 0.8006 😊
-hm            : 0.7952 🤝
-```
+- Loads the sample predictions and ground-truth answers spanning 8 languages.
+- Groups the processing by language for efficient model loading.
+- Computes `exact_match` and `rouge_l` scores.
+- Saves the per-question results, per-language summaries, and overall summary to a CSV file.
 
 ## Usage
 
-You can use SMILE as a Python library or from the command line.
+You can use SMILE natively from the command line.
 
 ### Input Data Format
 The input data for the evaluation script should in in JSON or JSONL format. Each entry in the file should be a dictionary containing the following keys:
 - **id** or **question_id**: A unique identifier for the question.
 - **question**: The question text.
-- **answer**: The ground-truth answer(s) for the question. This can be a string list of strings (for multiple references).
+- **answer** or **answers**: The ground-truth answer(s) for the question. This can be a string or list of strings (for multiple references).
 - **syn_ans**: Synthetic answers generated for the question against each answer(s). Not required in case `use_ans` flag is set.
-- **pred**: The predicted answer(s) for the question.
+- **pred** or **answer**: The predicted answer(s) for the question.
+- **lang**: (Optional in `input`, required in `ground-truth`) The 2-letter ISO code for the language (e.g. `ar`, `ja`, `en`).
+
+Example Ground-Truth JSONL line:
 ```json
-{
-  "id": "1",
-  "question": "What is the capital of France?",
-  "answer": "Paris",
-  "syn_ans": "The capital of France is Paris.",
-  "pred": "Paris is known to the capital of France." 
-}
+{"question_id": "1", "question": "What is the capital of France?", "answers": ["Paris"], "lang": "en"}
 ```
 
-### Python API
-
-```python
-from smile.smile import SMILE
-import sys
-
-# Ensure we can import from pyscripts even when running from repo root
-sys.path.append(str(Path(__file__).resolve().parent / "pyscripts"))
-from generate_scores import load_data
-
-# Example: evaluating a list of predictions against references - using the above input data format
-input_path = "sample_data/sample_input.json"
-args = SimpleNamespace(
-        input_file=str(input_path),
-        pred_file=None, # to be used if predictions are present in a separate file
-        use_ans=False,
-    )
-
-proc_data = load_data(args)
-
-# metrics to be computed - avg(average), hm(harmonic mean)
-eval_metrics = ['avg', 'hm']
-smile_obj = SMILE(emb_model = 'ember-v1',
-                  eval_metrics = eval_metrics, 
-                  assign_bins = <True/ False>, 
-                  use_exact_matching = <True/ False>, 
-                  save_emb_folder = <save emb folder path>, 
-                  load_emb_folder = <load emb folder path>, 
-                  syn_ans_model = <synthetic answer generation model name>, 
-                  verbose = <True/ False>)
-# When synthetic answer and ground-truth is a string
-results = smile_obj.generate_scores(proc_data)
-print(f"SMILE Score: {results}")
+Example Input Prediction JSONL line:
+```json
+{"question_id": "1", "question": "What is the capital of France?", "answer": "Paris is the capital of France."}
 ```
 
-### Using generate_scores.py
-The `generate_scores.py` script is a versatile tool for evaluating predictions against references using various metrics. It supports the following evaluation modes: SMILE, ROUGE, BERTScore, METEOR, Exact Match and sBERT.
-#### Generating SMILE Scores
-To compute SMILE scores, you can use the `--eval_mode`(default "smile"). The script automatically handles extracting the relevant keys from the input file and processes the data for evaluation.
+
+
+### Using `main.py`
+The `main.py` script is the primary entry point for large-scale multilingual evaluation. It accepts both input predictions and ground-truth JSONL files, aligns them by `question_id`, groups by language for efficiency, computes all specified metrics using a max-over-references policy, and outputs a results file containing per-question metrics and an aggregate summary.
+
+To compute SMILE and all other metrics and save the output as a CSV (or JSONL):
 ```bash
-python3 pyscripts/generate_scores.py \
-      --input_file path/to/input.json(l) \
-      --output_file path/to/output.pkl \
-      --eval_mode smile \
-      --timeit
+python3 main.py \
+      --input path/to/input_answers.jsonl \
+      --ground-truth path/to/ground_truth.jsonl \
+      --output path/to/output_results.csv \
+      --verbose
 ```
-> **Note**: You can set `--pred_file` in-case your predictions(i.e `pred`) are present in another file.
+
+If you only want to compute specific metrics:
+```bash
+python3 main.py --input inputs.jsonl --ground-truth gt.jsonl --metrics smile rouge exact_match
+```
 
 ## Supported Metrics
 
@@ -190,16 +147,15 @@ python3 pyscripts/generate_scores.py \
 | **sBERT** | Sentence-BERT cosine similarity |
 | **BLEURT** | Learned evaluation metric |
 | **MoverScore** | Earth mover's distance with BERT embeddings |
-| **GPT-3.5/GPT-4o** | LLM-as-judge evaluation |
+
 
 ## Configuration Options
 
 ### Embedding Models
-- `ember-v1`: Default embedding model for SMILE
+- **`ember-v1`**: Default embedding model for SMILE when `lang="en"`
+- **`paraphrase-multilingual-mpnet-base-v2`**: Default embedding model for SMILE & sBERT when using non-English languages.
+- **`bert-base-multilingual-cased`**: Default model for BERTScore & MoverScore when using non-English languages.
 
-### Synthetic Answer Models
-- `llama-3.2-3b-instruct`: Local Llama model (used in provided datasets)
-- `gpt-3.5-turbo`: OpenAI GPT-3.5 (requires API key)
 
 ## Datasets
 
@@ -245,7 +201,7 @@ sed -i '' -e "s/^device = 'cuda'$/device = 'cuda' if torch.cuda.is_available() e
 ```
 > **Note:** Adjust the path based on your Python version and virtual environment location.
 
-## Citation
+## Citation For Original SMILE Paper
 
 If you use this code or the SMILE metric in your research, please cite:
 
@@ -276,13 +232,10 @@ For more details, see the [full license text](https://creativecommons.org/licens
 
 ## Contributors
 
-- [Shrikant Kendre](https://github.com/shriawesome)
-- [Austin Xu]()
-- [Juan Carlos Niebles]()
-- [Shafiq Rayhan Joty]()
-- [Honglu Zhu]()
-- [Michael Ryoo]()
+- [Sai Teja Sunku]()
+- [Ronak Wani]()
+
 
 We welcome contributions! Please open an issue or pull request.
 
-**For more details, see the [paper on arXiv](https://arxiv.org/abs/2406.XXXX).**
+**For more details of the original SMILE paper, see the [paper on arXiv](https://arxiv.org/abs/2406.XXXX).**
