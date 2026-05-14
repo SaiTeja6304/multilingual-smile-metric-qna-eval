@@ -21,17 +21,19 @@ nltk.download('punkt_tab', quiet=True)
 nltk.download('wordnet', quiet=True)
 
 from multilingual_utils import (
-    normalize_lang, multilingual_tokenize,
+    normalize_lang, rouge_preprocess, multilingual_tokenize,
     get_bertscore_lang, get_bertscore_model, get_sbert_model,
-    get_moverscore_model, unicode_normalize
+    get_moverscore_model, unicode_normalize, is_char_tokenize_lang,
 )
 
 
-def _make_rouge_tokenizer(lang):
-    """Returns a tokenizer function for the given language."""
-    def tokenize(text):
-        return multilingual_tokenize(text, lang)
-    return tokenize
+class _MultilingualRougeTokenizer:
+    """Custom tokenizer for RougeScorer supporting non-space-delimited languages.
+    RougeScorer expects an object with a .tokenize(text) method, not a bare function."""
+    def __init__(self, lang):
+        self.lang = lang
+    def tokenize(self, text):
+        return multilingual_tokenize(text, self.lang)
 
 def compute_rouge_score(metrics:list=['rougeL'], pred_col='pred', sub_metrics=['fmeasure'], ref_data=None, ans_idx:int=1, lang:str='en'):
     """
@@ -58,7 +60,7 @@ def compute_rouge_score(metrics:list=['rougeL'], pred_col='pred', sub_metrics=['
 
     # Initialize ROUGE scorer
     # Disable stemmer for non-English
-    tokenizer = _make_rouge_tokenizer(lang) if lang != 'en' else None
+    tokenizer = _MultilingualRougeTokenizer(lang) if lang != 'en' else None
     use_stemmer = (lang == 'en')
     scorer = rouge_scorer.RougeScorer(metrics, use_stemmer=use_stemmer, tokenizer=tokenizer)
 
@@ -316,6 +318,15 @@ def compute_moverscore(inp_data, ans_idx=1, model='bert-base-uncased', n_gram=2,
             "MoverScore not found. Please install it using:\n"
             "pip install -U git+https://github.com/AIPHES/emnlp19-moverscore.git"
         )
+
+    # Apply CPU and numpy compatibility patches programmatically,
+    # so users don't need to manually patch the installed package.
+    import moverscore_v2 as _msv2
+    import numpy as _np
+    if not hasattr(_np, 'float'):
+        _np.float = float  # fix np.float removed in NumPy 2.0
+    # Ensure device is set correctly regardless of what the module loaded with
+    _msv2.device = device
     
     ans = [str(data[ans_idx]) for data in inp_data]
     preds = [str(data[-1]) for data in inp_data]
