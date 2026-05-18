@@ -8,6 +8,9 @@ import time
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from lingua import Language, LanguageDetectorBuilder, IsoCode639_1
 
 sys.path.append(str(Path(__file__).resolve().parent / "pyscripts"))
 
@@ -20,15 +23,54 @@ from utils import (
 )
 
 
+# ─── Language detection helpers ───
+
+_LANG_TO_LINGUA = {
+    "ar": Language.ARABIC,
+    "bn": Language.BENGALI,
+    "en": Language.ENGLISH,
+    "fi": Language.FINNISH,
+    "ja": Language.JAPANESE,
+    "ko": Language.KOREAN,
+    "ru": Language.RUSSIAN,
+    "te": Language.TELUGU,
+}
+_LINGUA_TO_LANG = {v: k for k, v in _LANG_TO_LINGUA.items()}
+_detector_cache = {}
+
+
+def _get_detector(question_lang: str):
+    """Get or build a lingua detector that chooses between English and question_lang."""
+    key = question_lang
+    if key not in _detector_cache:
+        langs = [Language.ENGLISH]
+        q_lingua = _LANG_TO_LINGUA.get(question_lang)
+        if q_lingua and q_lingua != Language.ENGLISH:
+            langs.append(q_lingua)
+        _detector_cache[key] = LanguageDetectorBuilder.from_languages(*langs).build()
+    return _detector_cache[key]
+
+
+def detect_answer_language(answer_text: str, question_lang: str) -> str:
+    """Detect whether the answer is in English or the question's language."""
+    question_lang = normalize_lang(question_lang)
+    if question_lang == "en":
+        return "en"
+    if not answer_text or not answer_text.strip():
+        return question_lang
+    detector = _get_detector(question_lang)
+    detected = detector.detect_language_of(answer_text)
+    if detected is None:
+        return question_lang
+    return _LINGUA_TO_LANG.get(detected, question_lang)
+
+
 # ─── Global state for signal handler ───
 _checkpoint_state = {
     "path": None,
     "results_per_question": None,
     "completed_tasks": None,
 }
-
-
-
 
 
 def _save_checkpoint():
@@ -45,7 +87,6 @@ def _save_checkpoint():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, path)
-
     print(f"\n  [CHECKPOINT] Saved to {path} ({len(data['completed_tasks'])} tasks done)", flush=True)
 
 
@@ -75,7 +116,6 @@ def _sigusr1_handler(signum, frame):
     sys.exit(42)
 
 
-# Register signal handler
 signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
 
@@ -96,6 +136,10 @@ def parse_arguments():
                         help="Which metrics to compute")
     parser.add_argument("--verbose", action="store_true",
                         help="Print detailed progress messages")
+    parser.add_argument("--smile-batch-size", type=int, default=512,
+                        help="Batch size for SMILE generate_scores calls (default: 512)")
+    parser.add_argument("--metric-workers", type=int, default=3,
+                        help="Number of parallel workers for non-SMILE metrics (default: 3)")
     return parser.parse_args()
 
 
@@ -115,7 +159,11 @@ def load_jsonl(filepath: str) -> list:
 
 
 def merge_data(input_data: list, gt_data: list) -> list:
-    """Merge input (LLM answers) with ground-truth by question_id."""
+    """Merge input (LLM answers) with ground-truth by question_id.
+
+    Detects the actual language of the first reference answer using lingua
+    (binary detection between English and the question language).
+    """
     gt_lookup = {}
     for item in gt_data:
         qid = str(item.get("question_id", item.get("id", "")))
@@ -123,6 +171,8 @@ def merge_data(input_data: list, gt_data: list) -> list:
 
     merged = []
     missing_count = 0
+    lang_detect_stats = {"same": 0, "english": 0}
+
     for item in input_data:
         qid = str(item.get("question_id", item.get("id", "")))
         gt = gt_lookup.get(qid)
@@ -134,18 +184,32 @@ def merge_data(input_data: list, gt_data: list) -> list:
         if isinstance(answers, str):
             answers = [answers]
 
-        lang = gt.get("lang", "en")
+        question_lang = gt.get("lang", "en")
+
+        # Detect the language of the first reference answer
+        first_answer = answers[0] if answers else ""
+        detected_lang = detect_answer_language(first_answer, question_lang)
+
+        if detected_lang == "en" and question_lang != "en":
+            lang_detect_stats["english"] += 1
+        else:
+            lang_detect_stats["same"] += 1
 
         merged.append({
             "question_id": qid,
             "question": item.get("question", ""),
             "pred": item.get("answer", ""),
             "answers": answers,
-            "lang": lang,
+            "lang": detected_lang,
+            "question_lang": question_lang,
         })
 
     if missing_count > 0:
         print(f"WARNING: {missing_count} questions in input had no matching ground-truth (skipped)")
+
+    print(f"  Language detection: {lang_detect_stats['same']} answers in question language, "
+          f"{lang_detect_stats['english']} answers detected as English")
+
     return merged
 
 
@@ -158,10 +222,15 @@ def group_by_language(merged_data: list) -> dict:
     return dict(groups)
 
 
-def compute_smile_scores(items: list, lang: str, verbose: bool = False) -> list:
-    """Compute SMILE scores for a batch of items in the same language."""
-    all_scores = []
+def compute_smile_scores(items: list, lang: str, batch_size: int = 512, verbose: bool = False) -> list:
+    """
+    Compute SMILE scores for a batch of items in the same language.
 
+    KEY OPTIMIZATION: Instead of calling generate_scores once per item (61k calls),
+    we expand all (item, reference) pairs into a single large qa_set and call
+    generate_scores in large batches. This amortizes model overhead and allows
+    GPU to process full batches rather than single rows.
+    """
     emb_model = get_smile_emb_model(lang)
     eval_metrics = ['avg', 'hm']
     smile_obj = SMILE(
@@ -173,122 +242,148 @@ def compute_smile_scores(items: list, lang: str, verbose: bool = False) -> list:
         verbose=verbose,
     )
 
-    for item in items:
-        pred = item["pred"]
-        best_avg = 0.0
-        best_hm = 0.0
+    # Expand: each item may have multiple reference answers.
+    # Track which original item each row belongs to.
+    all_rows = []       # list of [question, ref, ref, pred]
+    row_to_item = []    # parallel list: which item index does this row belong to
 
+    for item_idx, item in enumerate(items):
         for ref_ans in item["answers"]:
-            qa_set = np.array([[item["question"], ref_ans, ref_ans, pred]])
-            try:
-                results = smile_obj.generate_scores(qa_set)
-                avg_val = float(results["avg"][0])
-                hm_val = float(results["hm"][0])
-                if avg_val > best_avg:
-                    best_avg = avg_val
-                if hm_val > best_hm:
-                    best_hm = hm_val
-            except Exception as e:
-                if verbose:
-                    print(f"  SMILE error for qid={item['question_id']}: {e}")
-        best_score = {"smile_avg": best_avg, "smile_hm": best_hm}
-        all_scores.append(best_score)
+            all_rows.append([item["question"], ref_ans, ref_ans, item["pred"]])
+            row_to_item.append(item_idx)
 
-    return all_scores
+    # Run generate_scores in batches over the expanded rows
+    all_avg = np.zeros(len(all_rows))
+    all_hm  = np.zeros(len(all_rows))
 
+    total_batches = (len(all_rows) + batch_size - 1) // batch_size
+    for batch_idx in range(0, len(all_rows), batch_size):
+        batch_rows = all_rows[batch_idx: batch_idx + batch_size]
+        qa_set = np.array(batch_rows)
+        current_batch = batch_idx // batch_size + 1
+        if verbose or (current_batch % 10 == 0):
+            print(f"    SMILE batch {current_batch}/{total_batches} "
+                  f"(rows {batch_idx}–{batch_idx + len(batch_rows) - 1})", flush=True)
+        try:
+            results = smile_obj.generate_scores(qa_set)
+            all_avg[batch_idx: batch_idx + len(batch_rows)] = results["avg"]
+            all_hm [batch_idx: batch_idx + len(batch_rows)] = results["hm"]
+        except Exception as e:
+            if verbose:
+                print(f"  SMILE batch error at rows {batch_idx}-{batch_idx+len(batch_rows)-1}: {e}")
+            # scores stay 0 for this batch
 
-def compute_metric_batch(items: list, lang: str, metric_name: str, verbose: bool = False) -> list:
-    """Compute a single metric for a batch of items. Max score across references."""
-    all_scores = []
+    # Aggregate: take max across references for each item
+    best_avg = np.zeros(len(items))
+    best_hm  = np.zeros(len(items))
+    for row_idx, item_idx in enumerate(row_to_item):
+        if all_avg[row_idx] > best_avg[item_idx]:
+            best_avg[item_idx] = all_avg[row_idx]
+        if all_hm[row_idx] > best_hm[item_idx]:
+            best_hm[item_idx] = all_hm[row_idx]
 
-    for item in items:
-        pred = item["pred"]
-        best_score = -float("inf")
-
-        for ref_ans in item["answers"]:
-            ref_str = ref_ans if isinstance(ref_ans, str) else str(ref_ans)
-            data_row = [(item["question"], ref_str, ref_str, pred)]
-
-            try:
-                if metric_name == "rouge":
-                    result = compute_rouge_score(
-                        metrics=['rougeL'], ref_data=data_row,
-                        sub_metrics=['fmeasure'], ans_idx=1, lang=lang,
-                    )
-                    score = result['rougeL']['fmeasure'][0]
-                elif metric_name == "bertscore":
-                    result = compute_bert_score(inp_data=data_row, ans_idx=1, lang=lang)
-                    score = result['F1'][0]
-                elif metric_name == "meteor":
-                    result = compute_meteor_score(inp_data=data_row, ans_idx=1, lang=lang)
-                    score = result['meteor'][0]
-                elif metric_name == "exact_match":
-                    result = compute_exact_match(inp_data=data_row, ans_idx=1, lang=lang)
-                    score = result['exact_match'][0]
-                elif metric_name == "sbert":
-                    result = compute_sbert_score(inp_data=data_row, ans_idx=1, lang=lang)
-                    score = float(result[0])
-                elif metric_name == "bleurt":
-                    result = compute_bleurt_score(inp_data=data_row, ans_idx=1, lang=lang)
-                    score = result['scores'][0]
-                elif metric_name == "moverscore":
-                    device = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
-                    result = compute_moverscore(
-                        inp_data=data_row, ans_idx=1, lang=lang, device=device,
-                    )
-                    score = result['scores'][0]
-                else:
-                    score = 0.0
-            except Exception as e:
-                if verbose:
-                    print(f"  {metric_name} error for qid={item['question_id']}: {e}")
-                score = 0.0
-
-            if score > best_score:
-                best_score = score
-
-        all_scores.append(best_score if best_score > -float("inf") else 0.0)
-    return all_scores
+    return [{"smile_avg": float(best_avg[i]), "smile_hm": float(best_hm[i])}
+            for i in range(len(items))]
 
 
 def run_batched_metric(items: list, lang: str, metric_name: str, verbose: bool = False) -> list:
-    """Optimized batch computation for metrics that support it."""
-    all_single_ref = all(len(item["answers"]) == 1 for item in items)
+    """
+    Batch computation for a metric, supporting multiple reference answers.
 
-    if all_single_ref and metric_name in ("bertscore", "sbert", "rouge", "meteor", "exact_match", "bleurt", "moverscore"):
-        data_rows = [
-            (item["question"], item["answers"][0], item["answers"][0], item["pred"])
-            for item in items
-        ]
-        try:
-            if metric_name == "rouge":
-                result = compute_rouge_score(metrics=['rougeL'], ref_data=data_rows,
-                                             sub_metrics=['fmeasure'], ans_idx=1, lang=lang)
-                return result['rougeL']['fmeasure']
-            elif metric_name == "bertscore":
-                result = compute_bert_score(inp_data=data_rows, ans_idx=1, lang=lang)
-                return result['F1']
-            elif metric_name == "meteor":
-                result = compute_meteor_score(inp_data=data_rows, ans_idx=1, lang=lang)
-                return result['meteor']
-            elif metric_name == "exact_match":
-                result = compute_exact_match(inp_data=data_rows, ans_idx=1, lang=lang)
-                return result['exact_match']
-            elif metric_name == "sbert":
-                result = compute_sbert_score(inp_data=data_rows, ans_idx=1, lang=lang)
-                return result.tolist()
-            elif metric_name == "bleurt":
-                result = compute_bleurt_score(inp_data=data_rows, ans_idx=1, lang=lang)
-                return result['scores']
-            elif metric_name == "moverscore":
-                device = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
-                result = compute_moverscore(inp_data=data_rows, ans_idx=1, lang=lang, device=device)
-                return result['scores']
-        except Exception as e:
-            if verbose:
-                print(f"  Batch {metric_name} failed, falling back to per-item: {e}")
+    KEY OPTIMIZATION: For multi-reference items, we expand all (item, ref) pairs
+    into one flat batch, run the metric once, then take the max per item.
+    This replaces the old per-item loop that ran the metric N_refs times per item.
+    """
+    key_map = {
+        "rouge":        ("rougeL", "rougeL", "fmeasure"),
+        "bertscore":    ("F1",     None,     None),
+        "meteor":       ("meteor", "meteor", None),
+        "exact_match":  ("exact_match", "exact_match", None),
+        "sbert":        (None,     None,     None),
+        "bleurt":       ("scores", "scores", None),
+        "moverscore":   ("scores", "scores", None),
+    }
 
-    return compute_metric_batch(items, lang, metric_name, verbose)
+    # Build flat list of rows and track item origin
+    flat_rows = []
+    row_to_item = []
+    for item_idx, item in enumerate(items):
+        for ref_ans in item["answers"]:
+            flat_rows.append((item["question"], ref_ans, ref_ans, item["pred"]))
+            row_to_item.append(item_idx)
+
+    try:
+        if metric_name == "rouge":
+            result = compute_rouge_score(metrics=['rougeL'], ref_data=flat_rows,
+                                         sub_metrics=['fmeasure'], ans_idx=1, lang=lang)
+            flat_scores = result['rougeL']['fmeasure']
+        elif metric_name == "bertscore":
+            result = compute_bert_score(inp_data=flat_rows, ans_idx=1, lang=lang)
+            flat_scores = result['F1']
+        elif metric_name == "meteor":
+            result = compute_meteor_score(inp_data=flat_rows, ans_idx=1, lang=lang)
+            flat_scores = result['meteor']
+        elif metric_name == "exact_match":
+            result = compute_exact_match(inp_data=flat_rows, ans_idx=1, lang=lang)
+            flat_scores = result['exact_match']
+        elif metric_name == "sbert":
+            result = compute_sbert_score(inp_data=flat_rows, ans_idx=1, lang=lang)
+            flat_scores = result.tolist() if hasattr(result, 'tolist') else list(result)
+        elif metric_name == "bleurt":
+            result = compute_bleurt_score(inp_data=flat_rows, ans_idx=1, lang=lang)
+            flat_scores = result['scores']
+        elif metric_name == "moverscore":
+            device = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
+            result = compute_moverscore(inp_data=flat_rows, ans_idx=1, lang=lang, device=device)
+            flat_scores = result['scores']
+        else:
+            flat_scores = [0.0] * len(flat_rows)
+
+    except Exception as e:
+        if verbose:
+            print(f"  Batch {metric_name} failed: {e}. Falling back to per-item.")
+        # Per-item fallback (original slow path)
+        flat_scores = []
+        for row in flat_rows:
+            try:
+                if metric_name == "rouge":
+                    r = compute_rouge_score(metrics=['rougeL'], ref_data=[row],
+                                            sub_metrics=['fmeasure'], ans_idx=1, lang=lang)
+                    flat_scores.append(r['rougeL']['fmeasure'][0])
+                elif metric_name == "bertscore":
+                    r = compute_bert_score(inp_data=[row], ans_idx=1, lang=lang)
+                    flat_scores.append(r['F1'][0])
+                elif metric_name == "meteor":
+                    r = compute_meteor_score(inp_data=[row], ans_idx=1, lang=lang)
+                    flat_scores.append(r['meteor'][0])
+                elif metric_name == "exact_match":
+                    r = compute_exact_match(inp_data=[row], ans_idx=1, lang=lang)
+                    flat_scores.append(r['exact_match'][0])
+                elif metric_name == "sbert":
+                    r = compute_sbert_score(inp_data=[row], ans_idx=1, lang=lang)
+                    flat_scores.append(float(r[0]))
+                elif metric_name == "bleurt":
+                    r = compute_bleurt_score(inp_data=[row], ans_idx=1, lang=lang)
+                    flat_scores.append(r['scores'][0])
+                elif metric_name == "moverscore":
+                    device = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
+                    r = compute_moverscore(inp_data=[row], ans_idx=1, lang=lang, device=device)
+                    flat_scores.append(r['scores'][0])
+                else:
+                    flat_scores.append(0.0)
+            except Exception as e2:
+                if verbose:
+                    print(f"    per-item {metric_name} error: {e2}")
+                flat_scores.append(0.0)
+
+    # Aggregate: max score across references per item
+    best_scores = [-float("inf")] * len(items)
+    for row_idx, item_idx in enumerate(row_to_item):
+        s = float(flat_scores[row_idx])
+        if s > best_scores[item_idx]:
+            best_scores[item_idx] = s
+
+    return [s if s > -float("inf") else 0.0 for s in best_scores]
 
 
 def write_output(output_path, results_per_question, per_lang_summary, summary, metric_keys):
@@ -298,7 +393,7 @@ def write_output(output_path, results_per_question, per_lang_summary, summary, m
         os.makedirs(output_dir, exist_ok=True)
 
     if output_path.lower().endswith('.csv'):
-        fieldnames = ["question_id", "lang"] + metric_keys
+        fieldnames = ["question_id", "lang", "question_lang"] + metric_keys
         with open(output_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
@@ -321,15 +416,13 @@ def main():
 
     _checkpoint_state["output_path"] = args.output
 
-    # Remove the .csv from the checkpoint path if it's there
     base_path = args.output
     if base_path.endswith('.csv'):
         base_path = base_path[:-4]
-    
+
     checkpoint_path = base_path + ".checkpoint.json"
     _checkpoint_state["path"] = checkpoint_path
 
-    # Check if the output file already exists, and if it's completely finished
     if os.path.exists(args.output) and not os.path.exists(checkpoint_path):
         print(f"Output file {args.output} already exists and no checkpoint found.")
         print("Assuming this file is fully evaluated. Skipping.")
@@ -365,6 +458,7 @@ def main():
         results_per_question = [{
             "question_id": item["question_id"],
             "lang": normalize_lang(item["lang"]),
+            "question_lang": normalize_lang(item["question_lang"]),
         } for item in merged]
         completed_tasks = set()
 
@@ -374,17 +468,32 @@ def main():
     metrics_to_run = [m.lower() for m in args.metrics]
     total_start = time.time()
 
+    display_names = {
+        "rouge": "ROUGE-L", "bertscore": "BERTScore", "meteor": "METEOR",
+        "exact_match": "Exact Match", "sbert": "sBERT",
+        "bleurt": "BLEURT", "moverscore": "MoverScore",
+    }
+    key_map = {
+        "rouge": "rouge_l", "bertscore": "bert_score_f1",
+        "meteor": "meteor", "exact_match": "exact_match",
+        "sbert": "sbert", "bleurt": "bleurt", "moverscore": "moverscore",
+    }
+
     # ── 5. Compute metrics per language ──
     for lang, items in sorted(lang_groups.items()):
         indices = [qid_to_idx[item["question_id"]] for item in items]
 
-        # SMILE
+        # ── SMILE (GPU-heavy; run alone) ──
         if "smile" in metrics_to_run:
             task_key = (lang, "smile")
             if task_key not in completed_tasks:
                 print(f"\n  Computing SMILE for {lang} ({len(items)} questions)...", flush=True)
                 t0 = time.time()
-                smile_scores = compute_smile_scores(items, lang, verbose=args.verbose)
+                smile_scores = compute_smile_scores(
+                    items, lang,
+                    batch_size=args.smile_batch_size,
+                    verbose=args.verbose,
+                )
                 for idx, scores in zip(indices, smile_scores):
                     results_per_question[idx].update(scores)
                 completed_tasks.add(task_key)
@@ -393,42 +502,38 @@ def main():
             else:
                 print(f"\n  [SKIP] SMILE for {lang} — already completed", flush=True)
 
-        # Other metrics
+        # ── Other metrics (run in parallel with ThreadPoolExecutor) ──
         other_metrics = [m for m in metrics_to_run if m != "smile"]
-        for metric_name in other_metrics:
-            task_key = (lang, metric_name)
-            if task_key in completed_tasks:
-                display_name = {
-                    "rouge": "ROUGE-L", "bertscore": "BERTScore", "meteor": "METEOR",
-                    "exact_match": "Exact Match", "sbert": "sBERT",
-                    "bleurt": "BLEURT", "moverscore": "MoverScore",
-                }.get(metric_name, metric_name)
-                print(f"\n  [SKIP] {display_name} for {lang} — already completed", flush=True)
-                continue
+        pending = [m for m in other_metrics if (lang, m) not in completed_tasks]
+        skipped = [m for m in other_metrics if (lang, m) in completed_tasks]
 
-            display_name = {
-                "rouge": "ROUGE-L", "bertscore": "BERTScore", "meteor": "METEOR",
-                "exact_match": "Exact Match", "sbert": "sBERT",
-                "bleurt": "BLEURT", "moverscore": "MoverScore",
-            }.get(metric_name, metric_name)
+        for m in skipped:
+            print(f"\n  [SKIP] {display_names.get(m, m)} for {lang} — already completed", flush=True)
 
-            print(f"\n  Computing {display_name} for {lang} ({len(items)} questions)...", flush=True)
+        if not pending:
+            continue
+
+        print(f"\n  Computing {len(pending)} metrics for {lang} ({len(items)} questions) "
+              f"with up to {args.metric_workers} workers...", flush=True)
+
+        def _run_one_metric(metric_name):
             t0 = time.time()
             scores = run_batched_metric(items, lang, metric_name, verbose=args.verbose)
+            elapsed = time.time() - t0
+            return metric_name, scores, elapsed
 
-            key_map = {
-                "rouge": "rouge_l", "bertscore": "bert_score_f1",
-                "meteor": "meteor", "exact_match": "exact_match",
-                "sbert": "sbert", "bleurt": "bleurt", "moverscore": "moverscore",
-            }
-            key = key_map.get(metric_name, metric_name)
-
-            for idx, score in zip(indices, scores):
-                results_per_question[idx][key] = float(score)
-
-            completed_tasks.add(task_key)
-            _save_checkpoint()
-            print(f"    Done in {time.time() - t0:.1f}s", flush=True)
+        # Use threads — safe because each metric uses its own model/state,
+        # and GIL is released during C-extension/GPU work (torch, transformers).
+        with ThreadPoolExecutor(max_workers=args.metric_workers) as executor:
+            futures = {executor.submit(_run_one_metric, m): m for m in pending}
+            for future in as_completed(futures):
+                metric_name, scores, elapsed = future.result()
+                key = key_map.get(metric_name, metric_name)
+                for idx, score in zip(indices, scores):
+                    results_per_question[idx][key] = float(score)
+                completed_tasks.add((lang, metric_name))
+                _save_checkpoint()
+                print(f"    {display_names.get(metric_name, metric_name)} done in {elapsed:.1f}s", flush=True)
 
     total_time = time.time() - total_start
 
@@ -438,7 +543,7 @@ def main():
     metric_keys = set()
     for r in results_per_question:
         for k in r:
-            if k not in ("question_id", "lang"):
+            if k not in ("question_id", "lang", "question_lang"):
                 metric_keys.add(k)
     metric_keys = sorted(metric_keys)
 
@@ -448,8 +553,13 @@ def main():
         if values:
             summary[key] = float(np.mean(values))
 
+    # Per-language mean — grouped by question language
+    question_lang_groups = defaultdict(list)
+    for item in merged:
+        question_lang_groups[normalize_lang(item["question_lang"])].append(item)
+
     per_lang_summary = {}
-    for lang, items in sorted(lang_groups.items()):
+    for lang, items in sorted(question_lang_groups.items()):
         lang_indices = [qid_to_idx[item["question_id"]] for item in items]
         lang_summary = {"question_id": f"SUMMARY_{lang.upper()}", "lang": lang}
         for key in metric_keys:
@@ -474,7 +584,7 @@ def main():
 
     print(f"\nPer-Language Scores:")
     for lang, lang_summary in sorted(per_lang_summary.items()):
-        n = len(lang_groups[lang])
+        n = len(question_lang_groups[lang])
         print(f"\n  {lang.upper()} ({n} questions):")
         for key in metric_keys:
             if key in lang_summary:
@@ -486,8 +596,7 @@ def main():
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
         print(f"  [CHECKPOINT] Removed {checkpoint_path} (run completed successfully)")
-    
-    # Also clean up any old double-extension checkpoint files if they exist
+
     old_checkpoint_path = args.output + ".checkpoint.json"
     if os.path.exists(old_checkpoint_path):
         os.remove(old_checkpoint_path)

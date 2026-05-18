@@ -8,6 +8,8 @@ import numpy as np
 from pathlib import Path
 from collections import defaultdict
 
+from lingua import Language, LanguageDetectorBuilder, IsoCode639_1
+
 sys.path.append(str(Path(__file__).resolve().parent / "pyscripts"))
 
 from multilingual_utils import normalize_lang, get_smile_emb_model, unicode_normalize, SUPPORTED_LANGUAGES
@@ -17,6 +19,65 @@ from utils import (
     compute_exact_match, compute_sbert_score, compute_bleurt_score,
     compute_moverscore,
 )
+
+
+# ─── Language detection helpers ───
+
+# Mapping from our 2-letter codes to lingua Language enums
+_LANG_TO_LINGUA = {
+    "ar": Language.ARABIC,
+    "bn": Language.BENGALI,
+    "en": Language.ENGLISH,
+    "fi": Language.FINNISH,
+    "ja": Language.JAPANESE,
+    "ko": Language.KOREAN,
+    "ru": Language.RUSSIAN,
+    "te": Language.TELUGU,
+}
+
+# Reverse mapping
+_LINGUA_TO_LANG = {v: k for k, v in _LANG_TO_LINGUA.items()}
+
+# Cache of detectors keyed by (question_lang,) so we only build each once
+_detector_cache = {}
+
+
+def _get_detector(question_lang: str):
+    """Get or build a lingua detector that chooses between English and question_lang."""
+    key = question_lang
+    if key not in _detector_cache:
+        langs = [Language.ENGLISH]
+        q_lingua = _LANG_TO_LINGUA.get(question_lang)
+        if q_lingua and q_lingua != Language.ENGLISH:
+            langs.append(q_lingua)
+        _detector_cache[key] = LanguageDetectorBuilder.from_languages(*langs).build()
+    return _detector_cache[key]
+
+
+def detect_answer_language(answer_text: str, question_lang: str) -> str:
+    """
+    Detect whether the answer is in English or the question's language.
+
+    Uses a lingua detector restricted to only those two languages for
+    accurate binary classification.
+
+    Returns:
+        Normalized 2-letter language code (e.g. 'en', 'te', 'ar').
+    """
+    question_lang = normalize_lang(question_lang)
+    if question_lang == "en":
+        return "en"
+
+    if not answer_text or not answer_text.strip():
+        return question_lang  # default to question lang for empty answers
+
+    detector = _get_detector(question_lang)
+    detected = detector.detect_language_of(answer_text)
+
+    if detected is None:
+        return question_lang  # fallback
+
+    return _LINGUA_TO_LANG.get(detected, question_lang)
 
 
 def parse_arguments():
@@ -74,9 +135,16 @@ def load_jsonl(filepath: str) -> list:
 def merge_data(input_data: list, gt_data: list) -> list:
     """
     Merge input (LLM answers) with ground-truth by question_id.
-    
+
+    For each item, detects the actual language of the first reference answer
+    using lingua (binary detection between English and the question language).
+    The detected answer language is stored as 'lang' for metric evaluation,
+    and the original question language is preserved as 'question_lang'.
+
     Returns:
-        list of dicts with keys: question_id, question, pred, answers, lang
+        list of dicts with keys: question_id, question, pred, answers,
+                                  lang (detected answer lang),
+                                  question_lang (original from GT)
     """
     # Build ground-truth lookup by question_id
     gt_lookup = {}
@@ -86,6 +154,8 @@ def merge_data(input_data: list, gt_data: list) -> list:
 
     merged = []
     missing_count = 0
+    lang_detect_stats = {"same": 0, "english": 0}
+
     for item in input_data:
         qid = str(item.get("question_id", item.get("id", "")))
         gt = gt_lookup.get(qid)
@@ -98,19 +168,32 @@ def merge_data(input_data: list, gt_data: list) -> list:
         if isinstance(answers, str):
             answers = [answers]
 
-        lang = gt.get("lang", "en")
+        question_lang = gt.get("lang", "en")
+
+        # Detect the language of the first reference answer
+        first_answer = answers[0] if answers else ""
+        detected_lang = detect_answer_language(first_answer, question_lang)
+
+        if detected_lang == "en" and question_lang != "en":
+            lang_detect_stats["english"] += 1
+        else:
+            lang_detect_stats["same"] += 1
 
         merged.append({
             "question_id": qid,
             "question": item.get("question", ""),
             "pred": item.get("answer", ""),
             "answers": answers,
-            "lang": lang,
+            "lang": detected_lang,
+            "question_lang": question_lang,
         })
 
     if missing_count > 0:
         print(f"WARNING: {missing_count} questions in input had no matching ground-truth (skipped)")
-    
+
+    print(f"  Language detection: {lang_detect_stats['same']} answers in question language, "
+          f"{lang_detect_stats['english']} answers detected as English")
+
     return merged
 
 
@@ -319,6 +402,7 @@ def main():
     results_per_question = [{
         "question_id": item["question_id"],
         "lang": normalize_lang(item["lang"]),
+        "question_lang": normalize_lang(item["question_lang"]),
     } for item in merged]
 
     metrics_to_run = [m.lower() for m in args.metrics]
@@ -376,7 +460,7 @@ def main():
     metric_keys = set()
     for r in results_per_question:
         for k in r:
-            if k not in ("question_id", "lang"):
+            if k not in ("question_id", "lang", "question_lang"):
                 metric_keys.add(k)
     metric_keys = sorted(metric_keys)
 
@@ -388,8 +472,12 @@ def main():
             summary[key] = float(np.mean(values))
 
     # Per-language mean
+    question_lang_groups = defaultdict(list)
+    for item in merged:
+        question_lang_groups[normalize_lang(item["question_lang"])].append(item)
+
     per_lang_summary = {}
-    for lang, items in sorted(lang_groups.items()):
+    for lang, items in sorted(question_lang_groups.items()):
         lang_indices = [qid_to_idx[item["question_id"]] for item in items]
         lang_summary = {"question_id": f"SUMMARY_{lang.upper()}", "lang": lang}
         for key in metric_keys:
@@ -406,9 +494,9 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
 
     if args.output.lower().endswith('.csv'):
-        fieldnames = ["question_id", "lang"] + metric_keys
+        fieldnames = ["question_id", "lang", "question_lang"] + metric_keys
         with open(args.output, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             # Write per-question results
             for r in results_per_question:
@@ -444,7 +532,7 @@ def main():
 
     print(f"\nPer-Language Scores:")
     for lang, lang_summary in sorted(per_lang_summary.items()):
-        n = len(lang_groups[lang])
+        n = len(question_lang_groups[lang])
         print(f"\n  {lang.upper()} ({n} questions):")
         for key in metric_keys:
             if key in lang_summary:

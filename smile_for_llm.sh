@@ -34,7 +34,10 @@ requeue_handler() {
 }
 trap requeue_handler SIGUSR1
 
+module load cuda12.6/toolkit/12.6.2
+module load cuda12.1/toolkit/12.1.1
 module load python
+export LD_LIBRARY_PATH=/cm/shared/apps/cuda12.6/toolkit/12.6.2/targets/x86_64-linux/lib:/cm/shared/apps/cuda12.1/toolkit/12.1.1/targets/x86_64-linux/lib:/cm/local/apps/cuda/libs/current/lib64:$LD_LIBRARY_PATH
 
 REPO=/home/ssunku/directed_research/multilingual_smile
 source ${REPO}/venv/bin/activate
@@ -76,11 +79,24 @@ mkdir -p ${OUT_DIR}/${MODEL}
 
 echo "$(date): ARRAY_TASK=${SLURM_ARRAY_TASK_ID} | Model=${MODEL} | Dataset=${PRED_STEMS[$DATASET_IDX]}"
 
+# Pre-warm TensorFlow PTX kernel compilation (one-time per node, ~30min first time)
+echo "$(date): Pre-warming TensorFlow GPU PTX cache..."
+python -c "
+import tensorflow as tf
+import numpy as np
+a = tf.constant(np.ones((2,2), dtype=np.float32))
+_ = tf.matmul(a, a).numpy()
+print('TF GPU warmed:', tf.config.list_physical_devices('GPU'))
+" 2>/dev/null
+echo "$(date): TF warmup done."
+
 # Run the evaluation script
 python gpu_main.py \
     --input        "${PRED}" \
     --ground-truth "${GT}" \
-    --output       "${OUT}" &
+    --output       "${OUT}" \
+    --smile-batch-size 1024 \
+    --metric-workers 1
 
 wait
 echo "$(date): Array task ${SLURM_ARRAY_TASK_ID} complete."
