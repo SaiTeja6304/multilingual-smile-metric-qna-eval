@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH -J SMILE
 #SBATCH -p short
 #SBATCH -t 24:00:00
@@ -90,12 +90,15 @@ print('TF GPU warmed:', tf.config.list_physical_devices('GPU'))
 " 2>/dev/null
 echo "$(date): TF warmup done."
 
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+export TF_GPU_ALLOCATOR=cuda_malloc_async
+
 # Run the evaluation script
 python gpu_main.py \
     --input        "${PRED}" \
     --ground-truth "${GT}" \
     --output       "${OUT}" \
-    --smile-batch-size 1024 \
+    --smile-batch-size 512 \
     --metric-workers 1
 
 wait
